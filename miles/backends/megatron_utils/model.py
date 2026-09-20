@@ -42,6 +42,7 @@ from ..training_utils.ci_utils import check_grad_norm, check_kl
 from ..training_utils.data import DataIterator, get_batch
 from ..training_utils.log_utils import aggregate_forward_results, aggregate_train_losses, log_train_step
 from ..training_utils.loss import loss_function
+from ..training_utils.loss_hub.logit_processors import get_log_probs_and_entropy
 from ..training_utils.parallel import get_parallel_state
 from .checkpoint import load_checkpoint, save_checkpoint, save_checkpoint_with_lora
 from .ci_utils import (
@@ -50,6 +51,7 @@ from .ci_utils import (
     compute_model_hashes_by_layer,
     save_model_hashes,
 )
+from .compact_logits import can_compact_actor_logits, compact_logits_output_processor
 from .initialize import is_first_replica_megatron_main_rank
 from .lora.utils import is_lora_enabled, is_lora_model
 from .model_provider import get_model_provider_func
@@ -288,6 +290,8 @@ def forward_only(
         Aggregated outputs keyed by ``store_prefix + key``.
     """
 
+    use_compact_logits = f is get_log_probs_and_entropy and can_compact_actor_logits(args)
+
     dumper_phase_util = DumperMegatronUtil(
         args, model, DumperPhase.FWD_ONLY, rollout_id=rollout_id, store_prefix=store_prefix
     )
@@ -318,6 +322,7 @@ def forward_only(
             args.data_pad_size_multiplier,
             args.qkv_format,
             allgather_cp=args.allgather_cp,
+            prepare_output_loss_masks=use_compact_logits,
         )
         unconcat_tokens = batch["unconcat_tokens"]
         tokens = batch["tokens"]
@@ -336,7 +341,8 @@ def forward_only(
             attention_mask=None,
             labels=None,
             packed_seq_params=packed_seq_params,
-            loss_mask=batch["input_loss_masks"],
+            loss_mask=batch["output_loss_masks"] if use_compact_logits else batch["input_loss_masks"],
+            **({"output_processor": compact_logits_output_processor} if use_compact_logits else {}),
             **(filter_keys(batch, ["witness_ids"]) if args.enable_witness else {}),
             **(batch["multimodal_train_inputs"] if batch["multimodal_train_inputs"] is not None else {}),
             fp32_output=fp32_output,
@@ -350,6 +356,7 @@ def forward_only(
             response_lengths=response_lengths,
             with_entropy=args.use_rollout_entropy,
             max_seq_lens=batch.get("max_seq_lens", None),
+            output_loss_masks=batch["output_loss_masks"] if use_compact_logits else None,
         )
 
     # Turn on evaluation mode which disables dropout.
@@ -424,6 +431,8 @@ def run_forward_backward_pass(
             (loss, num_elems, {"keys": list[str], "values": torch.Tensor}).
         """
 
+        use_compact_logits = can_compact_actor_logits(args)
+
         # Get the batch.
         batch = get_batch(
             data_iterator,
@@ -451,6 +460,7 @@ def run_forward_backward_pass(
             args.data_pad_size_multiplier,
             args.qkv_format,
             allgather_cp=args.allgather_cp,
+            prepare_output_loss_masks=use_compact_logits,
         )
 
         if "adapter_token_counts" in batch:
@@ -491,6 +501,10 @@ def run_forward_backward_pass(
             if (x := batch["multimodal_train_inputs"]) is not None:
                 forward_kwargs.update(x)
 
+            use_compact_logits = use_compact_logits and batch.get("loss_fn") is None
+            if use_compact_logits:
+                forward_kwargs["loss_mask"] = batch["output_loss_masks"]
+                forward_kwargs["output_processor"] = compact_logits_output_processor
             output_tensor = model(**forward_kwargs, fp32_output=args.loss_type not in ("policy_loss", "sft_loss"))
 
         for m, old_stage in zip(all_replay_managers, old_stages, strict=True):
