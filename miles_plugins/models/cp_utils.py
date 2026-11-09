@@ -106,6 +106,47 @@ class _Relayout(torch.autograd.Function):
         return _gather_select(grad_output, inverse_index, ctx.cp_group), None, None, None
 
 
+def _all_to_all_select(hidden_states, send_order, recv_order, send_sizes, recv_sizes, cp_group):
+    send_buffer = hidden_states.index_select(0, send_order)
+    recv_buffer = torch.empty_like(send_buffer)
+    dist.all_to_all_single(
+        recv_buffer,
+        send_buffer,
+        output_split_sizes=recv_sizes,
+        input_split_sizes=send_sizes,
+        group=cp_group,
+    )
+    return torch.empty_like(recv_buffer).index_copy_(0, recv_order, recv_buffer)
+
+
+class _AllToAllRelayout(torch.autograd.Function):
+    """A permutation's backward is its inverse transport, without CP reduction or scaling."""
+
+    @staticmethod
+    def forward(ctx, hidden_states, index, inverse_index, cp_group):
+        local_length = hidden_states.size(0)
+        cp_size = dist.get_world_size(cp_group)
+        send_peers = inverse_index // local_length
+        recv_peers = index // local_length
+        send_order = torch.argsort(send_peers, stable=True)
+        recv_order = torch.argsort(index)
+        sizes = (
+            torch.stack([torch.bincount(send_peers, minlength=cp_size), torch.bincount(recv_peers, minlength=cp_size)])
+            .cpu()
+            .tolist()
+        )
+        ctx.send_sizes, ctx.recv_sizes = sizes
+        ctx.cp_group = cp_group
+        ctx.save_for_backward(send_order, recv_order)
+        return _all_to_all_select(hidden_states, send_order, recv_order, ctx.send_sizes, ctx.recv_sizes, cp_group)
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        send_order, recv_order = ctx.saved_tensors
+        result = _all_to_all_select(grad_output, recv_order, send_order, ctx.recv_sizes, ctx.send_sizes, ctx.cp_group)
+        return result, None, None, None
+
+
 def _planned_relayout(hidden_states, layout: CPLayoutMetadata, cp_group, plan: CPTransferPlan, communication):
     if hidden_states.size(0) != layout.local_total_len:
         raise ValueError(f"Expected local total length {layout.local_total_len}, got {hidden_states.size(0)}")
@@ -171,9 +212,13 @@ def zigzag_to_packed_shard(
     hidden_states, cu_seqlens, cp_group, cp_rank, cp_size, *, layout=None, communication="all_to_all"
 ):
     """Use a microbatch's CPU plan when supplied; preserve the device-map path for other callers."""
+    if communication not in ("all_gather", "all_to_all"):
+        raise ValueError(f"Unsupported CP communication: {communication}")
     if layout is not None:
         return _PlannedRelayout.apply(hidden_states, layout, cp_group, True, communication)
     to_packed, to_zigzag = _relayout_indices(cu_seqlens, cp_rank, cp_size, hidden_states.size(0) * cp_size)
+    if communication == "all_to_all":
+        return _AllToAllRelayout.apply(hidden_states, to_packed, to_zigzag, cp_group)
     return _Relayout.apply(hidden_states, to_packed, to_zigzag, cp_group)
 
 
@@ -181,7 +226,11 @@ def packed_shard_to_zigzag(
     hidden_states, cu_seqlens, cp_group, cp_rank, cp_size, *, layout=None, communication="all_to_all"
 ):
     """Undo the packed-stream permutation using the same microbatch plan and transport."""
+    if communication not in ("all_gather", "all_to_all"):
+        raise ValueError(f"Unsupported CP communication: {communication}")
     if layout is not None:
         return _PlannedRelayout.apply(hidden_states, layout, cp_group, False, communication)
     to_packed, to_zigzag = _relayout_indices(cu_seqlens, cp_rank, cp_size, hidden_states.size(0) * cp_size)
+    if communication == "all_to_all":
+        return _AllToAllRelayout.apply(hidden_states, to_zigzag, to_packed, cp_group)
     return _Relayout.apply(hidden_states, to_zigzag, to_packed, cp_group)

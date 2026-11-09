@@ -9,6 +9,8 @@ import os
 import sys
 from argparse import Namespace
 from datetime import timedelta
+from functools import partial
+from unittest.mock import patch
 
 import torch
 import torch.distributed as dist
@@ -20,7 +22,7 @@ from tests.ci.ci_register import register_cuda_ci, register_rocm_ci
 from miles.backends.megatron_utils.megatron_to_hf.linear_attn_layout import LinearAttnHeads
 from miles.backends.megatron_utils.parallel import get_packed_seq_params
 from miles_plugins.models.cp_layout import build_cp_layout_metadata
-from miles_plugins.models.cp_utils import _relayout_indices
+from miles_plugins.models.cp_utils import _relayout_indices, packed_shard_to_zigzag, zigzag_to_packed_shard
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "..", "fast-gpu"))
 from linear_attn_reference import ReplicatedGDN, ReplicatedKDA, build_layer, packed, rel_err  # noqa: E402
@@ -73,9 +75,19 @@ def check_planned_relayout(ref, config, rank, world_size):
     hidden = full.index_select(0, to_zigzag)
     grad_output = torch.randn_like(hidden)
     reference_input = hidden.detach().requires_grad_(True)
-    reference, _ = layer(reference_input, packed_seq_params=packed(cu_seqlens))
-    assert torch.isfinite(reference).all(), "Unplanned reference output is non-finite"
-    reference.backward(grad_output)
+    with (
+        patch(
+            "miles_plugins.models.linear_attn.zigzag_to_packed_shard",
+            partial(zigzag_to_packed_shard, communication="all_gather"),
+        ),
+        patch(
+            "miles_plugins.models.linear_attn.packed_shard_to_zigzag",
+            partial(packed_shard_to_zigzag, communication="all_gather"),
+        ),
+    ):
+        reference, _ = layer(reference_input, packed_seq_params=packed(cu_seqlens))
+        assert torch.isfinite(reference).all(), "Unplanned reference output is non-finite"
+        reference.backward(grad_output)
     reference_grads = {name: param.grad.clone() for name, param in layer.named_parameters() if param.grad is not None}
     layer.zero_grad(set_to_none=True)
     params = get_packed_seq_params(

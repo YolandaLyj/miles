@@ -108,12 +108,22 @@ def test_against_unplanned_relayout(rank, cp_size, cp_group):
             grad_output = torch.randn_like(hidden.transpose(1, 2)).transpose(1, 2)
             for transform in (zigzag_to_packed_shard, packed_shard_to_zigzag):
                 reference_input = hidden.detach().requires_grad_(True)
-                reference = transform(reference_input, cu_seqlens, cp_group, rank, cp_size)
+                reference = transform(reference_input, cu_seqlens, cp_group, rank, cp_size, communication="all_gather")
                 reference.backward(grad_output)
-                for communication in ("all_gather", "all_to_all"):
+                for candidate_layout, communication in (
+                    (None, "all_to_all"),
+                    (layout, "all_gather"),
+                    (layout, "all_to_all"),
+                ):
                     candidate_input = hidden.detach().requires_grad_(True)
                     candidate = transform(
-                        candidate_input, None, cp_group, rank, cp_size, layout=layout, communication=communication
+                        candidate_input,
+                        cu_seqlens,
+                        cp_group,
+                        rank,
+                        cp_size,
+                        layout=candidate_layout,
+                        communication=communication,
                     )
                     candidate.backward(grad_output)
                     torch.testing.assert_close(candidate, reference, atol=0, rtol=0)

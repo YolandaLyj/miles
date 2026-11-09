@@ -18,7 +18,10 @@ from miles_plugins.models.cp_utils import packed_shard_to_zigzag, zigzag_to_pack
 
 
 def measure(hidden, grad_output, cu_seqlens, layout, mode, warmup, iterations):
-    kwargs = {} if mode == "main" else {"layout": layout, "communication": mode}
+    kwargs = {
+        "layout": layout if mode in ("planned_ag", "planned_a2a") else None,
+        "communication": "all_to_all" if mode in ("all_to_all", "planned_a2a") else "all_gather",
+    }
 
     def step():
         hidden.grad = None
@@ -66,13 +69,16 @@ def main():
             if tokens % (8 * cp_size):
                 raise ValueError("Token count must be divisible by 8 * CP")
             boundaries = [0, tokens // 4, tokens // 2, 3 * tokens // 4, tokens, tokens + 3 * cp_size]
+            planning_start = time.perf_counter()
             layout = build_cp_layout_metadata(boundaries, cp_size, rank)
+            planning_ms = (time.perf_counter() - planning_start) * 1000
             cu_seqlens = torch.tensor(boundaries, device="cuda", dtype=torch.int32)
             hidden = torch.randn(layout.local_total_len, 1, args.hidden_size, device="cuda", dtype=torch.bfloat16)
             hidden.requires_grad_(True)
             grad_output = torch.randn_like(hidden)
-            for mode in ("main", "all_gather", "all_to_all"):
+            for mode in ("main", "planned_ag", "all_to_all", "planned_a2a"):
                 metrics = measure(hidden, grad_output, cu_seqlens, layout, mode, args.warmup, args.iterations)
+                metrics["cpu_planning_ms"] = planning_ms
                 per_rank = [None] * cp_size
                 dist.all_gather_object(per_rank, metrics)
                 row = {
